@@ -1,3 +1,10 @@
+// https://github.com/mattes/migrate/blob/035c07716cd373d88456ec4d701402df52584cb4/database/driver.go
+// を元に機能拡張
+// - 過去の migration 実行履歴を保存するようにする
+//
+// 変更箇所:
+// - Driver interface にメソッド追加
+
 // Package database provides the Database interface.
 // All database drivers must implement this interface, register themselves,
 // optionally provide a `WithInstance` function and pass the tests
@@ -70,6 +77,12 @@ type Driver interface {
 	// When no migration has been applied, it must return version -1.
 	// Dirty means, a previous migration failed and user interaction is required.
 	Version() (version int, dirty bool, err error)
+
+	// FindVersion ...
+	FindVersion(optVersion int) (version int, dirty bool, err error)
+
+	// DeleteVersion ...
+	DeleteVersion(version int) (err error)
 
 	// Drop deletes everyting in the database.
 	Drop() error

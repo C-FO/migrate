@@ -1,3 +1,11 @@
+// https://github.com/mattes/migrate/blob/035c07716cd373d88456ec4d701402df52584cb4/database/mysql/mysql.go
+// を元に機能拡張
+// - 過去の migration 実行履歴を保存するようにする
+//
+// 変更箇所:
+// - SetVersion, Version メソッド実装変更
+// - FindVersion, DeleteVersion メソッド追加
+
 package mysql
 
 import (
@@ -11,9 +19,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/golang-migrate/migrate"
+	"github.com/golang-migrate/migrate/database"
 	"github.com/go-sql-driver/mysql"
-	"github.com/mattes/migrate"
-	"github.com/mattes/migrate/database"
 )
 
 func init() {
@@ -214,16 +222,24 @@ func (m *Mysql) SetVersion(version int, dirty bool) error {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
 
-	query := "TRUNCATE `" + m.config.MigrationsTable + "`"
-	if _, err := m.db.Exec(query); err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
+	// mattes/migrate の元実装では最後の version の情報しか持たないためここで TRUNCATE するが、
+	// 本実装では version ごとに履歴を持つため TRUNCATE せず INSERT or UPDATE する
 
 	if version >= 0 {
-		query := "INSERT INTO `" + m.config.MigrationsTable + "` (version, dirty) VALUES (?, ?)"
-		if _, err := m.db.Exec(query, version, dirty); err != nil {
-			tx.Rollback()
-			return &database.Error{OrigErr: err, Query: []byte(query)}
+		fVersion, _, _ := m.FindVersion(version)
+		// 該当 version の行が存在すれば UPDATE する
+		if fVersion >= 0 {
+			query := "UPDATE `" + m.config.MigrationsTable + "` SET dirty = ? WHERE version = ?"
+			if _, err := m.db.Exec(query, dirty, version); err != nil {
+				tx.Rollback()
+				return &database.Error{OrigErr: err, Query: []byte(query)}
+			}
+		} else { // 該当 version の行が存在しなければ INSERT する
+			query := "INSERT INTO `" + m.config.MigrationsTable + "` (version, dirty) VALUES (?, ?)"
+			if _, err := m.db.Exec(query, version, dirty); err != nil {
+				tx.Rollback()
+				return &database.Error{OrigErr: err, Query: []byte(query)}
+			}
 		}
 	}
 
@@ -235,7 +251,8 @@ func (m *Mysql) SetVersion(version int, dirty bool) error {
 }
 
 func (m *Mysql) Version() (version int, dirty bool, err error) {
-	query := "SELECT version, dirty FROM `" + m.config.MigrationsTable + "` LIMIT 1"
+	// 本実装では最も version が大きいものを返す
+	query := "SELECT version, dirty FROM `" + m.config.MigrationsTable + "` ORDER BY version DESC LIMIT 1"
 	err = m.db.QueryRow(query).Scan(&version, &dirty)
 	switch {
 	case err == sql.ErrNoRows:
@@ -252,6 +269,31 @@ func (m *Mysql) Version() (version int, dirty bool, err error) {
 	default:
 		return version, dirty, nil
 	}
+}
+
+// FindVersion 指定 version の履歴を取得する
+func (m *Mysql) FindVersion(optVersion int) (version int, dirty bool, err error) {
+	query := "SELECT version, dirty FROM `" + m.config.MigrationsTable + "` WHERE version = ? LIMIT 1"
+	err = m.db.QueryRow(query, optVersion).Scan(&version, &dirty)
+	switch {
+	case err == sql.ErrNoRows:
+		return database.NilVersion, false, err
+
+	case err != nil:
+		return database.NilVersion, false, &database.Error{OrigErr: err, Query: []byte(query)}
+
+	default:
+		return version, dirty, nil
+	}
+}
+
+// DeleteVersion 指定 version の履歴を削除する
+func (m *Mysql) DeleteVersion(version int) error {
+	query := "DELETE FROM `" + m.config.MigrationsTable + "` WHERE version = ?"
+	if _, err := m.db.Exec(query, version); err != nil {
+		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
+	return nil
 }
 
 func (m *Mysql) Drop() error {

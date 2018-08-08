@@ -1,3 +1,15 @@
+// https://github.com/mattes/migrate/blob/035c07716cd373d88456ec4d701402df52584cb4/migrate.go
+// を元に機能拡張
+// - 特定の migration のみを Up/Down できるようにする
+// - 実行が漏れた過去の migration が自動で実行されるようにする
+//
+// https://github.com/mattes/migrate/blob/035c07716cd373d88456ec4d701402df52584cb4/util.go
+// を一部コピー
+//
+// 変更箇所:
+// - runMigrations メソッド実装変更
+// - UpAll, UpVersion, DownVersion, readVersion メソッド追加
+
 // Package migrate reads migrations from sources and runs them against databases.
 // Sources are defined by the `source.Driver` and databases by the `database.Driver`
 // interface. The driver interfaces are kept "dump", all migration logic is kept
@@ -5,12 +17,13 @@
 package migrate
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/mattes/migrate/database"
+	"github.com/golang-migrate/migrate/database"
 	"github.com/mattes/migrate/source"
 )
 
@@ -25,10 +38,12 @@ var DefaultPrefetchMigrations = uint(10)
 var DefaultLockTimeout = 15 * time.Second
 
 var (
-	ErrNoChange    = fmt.Errorf("no change")
-	ErrNilVersion  = fmt.Errorf("no migration")
-	ErrLocked      = fmt.Errorf("database locked")
-	ErrLockTimeout = fmt.Errorf("timeout: can't acquire database lock")
+	ErrNoChange        = fmt.Errorf("no change")
+	ErrNilVersion      = fmt.Errorf("no migration")
+	ErrLocked          = fmt.Errorf("database locked")
+	ErrLockTimeout     = fmt.Errorf("timeout: can't acquire database lock")
+	ErrAlreadyMigrated = fmt.Errorf("already migrated")
+	ErrNotYetMigrated  = fmt.Errorf("not migrated yet")
 )
 
 // ErrShortLimit is an error returned when not enough migrations
@@ -279,6 +294,41 @@ func (m *Migrate) Up() error {
 	return m.unlockErr(m.runMigrations(ret))
 }
 
+// UpAll migrates all the way up from the first migration to the last
+// skipping applied ones.
+func (m *Migrate) UpAll() error {
+	if err := m.lock(); err != nil {
+		return err
+	}
+
+	ret := make(chan interface{}, m.PrefetchMigrations)
+
+	go m.readUp(-1, -1, ret)
+	return m.unlockErr(m.runMigrations(ret))
+}
+
+// UpVersion applies the specified up migration version.
+func (m *Migrate) UpVersion(version int, force bool) error {
+	if err := m.lock(); err != nil {
+		return err
+	}
+
+	if !force {
+		fVersion, dirty, err := m.databaseDrv.FindVersion(version)
+		if err != nil && err != sql.ErrNoRows {
+			return m.unlockErr(err)
+		}
+
+		if !(fVersion == database.NilVersion || dirty) {
+			return m.unlockErr(ErrAlreadyMigrated)
+		}
+	}
+
+	ret := make(chan interface{}, m.PrefetchMigrations)
+	go m.readVersion(int(version), 1, ret)
+	return m.unlockErr(m.runMigrations(ret))
+}
+
 // Down looks at the currently active migration version
 // and will migrate all the way down (applying all down migrations).
 func (m *Migrate) Down() error {
@@ -297,6 +347,31 @@ func (m *Migrate) Down() error {
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
 	go m.readDown(curVersion, -1, ret)
+	return m.unlockErr(m.runMigrations(ret))
+}
+
+// DownVersion applies the specified down migration version.
+func (m *Migrate) DownVersion(version int, force bool) error {
+	if err := m.lock(); err != nil {
+		return err
+	}
+
+	if !force {
+		fVersion, dirty, err := m.databaseDrv.FindVersion(version)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return m.unlockErr(ErrNotYetMigrated)
+			}
+			return m.unlockErr(err)
+		}
+
+		if fVersion == database.NilVersion || dirty {
+			return m.unlockErr(ErrNotYetMigrated)
+		}
+	}
+
+	ret := make(chan interface{}, m.PrefetchMigrations)
+	go m.readVersion(int(version), -1, ret)
 	return m.unlockErr(m.runMigrations(ret))
 }
 
@@ -671,6 +746,39 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 	}
 }
 
+// readVersion reads the specified migration.
+// It reads up migration if `vec` >= 0, and down if `vec` < 0.
+// Migration is then written to the ret channel.
+// If an error occurs during reading, that error is written to the ret channel, too.
+// Once readVersion is done reading it will close the ret channel.
+func (m *Migrate) readVersion(version int, vec int, ret chan<- interface{}) {
+	defer close(ret)
+
+	// check if version exists
+	if version >= 0 {
+		if m.versionExists(suint(version)) != nil {
+			ret <- os.ErrNotExist
+			return
+		}
+	}
+
+	var target int
+	if vec > 0 {
+		target = int(version)
+	} else {
+		target = -1
+	}
+	migr, err := m.newMigration(suint(version), target)
+	if err != nil {
+		ret <- err
+		return
+	}
+
+	ret <- migr
+	go migr.Buffer()
+	version = int(version)
+}
+
 // runMigrations reads *Migration and error from a channel. Any other type
 // sent on this channel will result in a panic. Each migration is then
 // proxied to the database driver and run against the database.
@@ -691,9 +799,22 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 		case *Migration:
 			migr := r.(*Migration)
 
-			// set version with dirty state
-			if err := m.databaseDrv.SetVersion(migr.TargetVersion, true); err != nil {
-				return err
+			// Up マイグレーションの場合
+			if migr.TargetVersion >= int(migr.Version) && migr.TargetVersion >= 0 {
+				fVersion, dirty, err := m.databaseDrv.FindVersion(int(migr.Version))
+				if err != nil && err != sql.ErrNoRows {
+					return err
+				}
+
+				// 既にマイグレーション実行済みであればスキップする
+				if !(fVersion == database.NilVersion || dirty) {
+					continue
+				}
+
+				// set version with dirty state
+				if err := m.databaseDrv.SetVersion(migr.TargetVersion, true); err != nil {
+					return err
+				}
 			}
 
 			if migr.Body != nil {
@@ -703,9 +824,19 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 				}
 			}
 
-			// set clean state
-			if err := m.databaseDrv.SetVersion(migr.TargetVersion, false); err != nil {
-				return err
+			// Up マイグレーションの場合
+			if migr.TargetVersion >= int(migr.Version) {
+				if migr.TargetVersion >= 0 {
+					// set clean state
+					if err := m.databaseDrv.SetVersion(migr.TargetVersion, false); err != nil {
+						return err
+					}
+				}
+			} else { // Down マイグレーションの場合
+				// 履歴を削除する
+				if err := m.databaseDrv.DeleteVersion(int(migr.Version)); err != nil {
+					return err
+				}
 			}
 
 			endTime := time.Now()
@@ -869,7 +1000,6 @@ func (m *Migrate) lock() error {
 		} else {
 			errchan <- nil
 		}
-		return
 	}()
 
 	// wait until we either recieve ErrLockTimeout or error from Lock operation
