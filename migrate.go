@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang-migrate/migrate/database"
+	"github.com/C-FO/migrate/database"
 	"github.com/mattes/migrate/source"
 )
 

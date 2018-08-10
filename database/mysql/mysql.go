@@ -19,8 +19,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang-migrate/migrate"
-	"github.com/golang-migrate/migrate/database"
+	"github.com/C-FO/migrate"
+	"github.com/C-FO/migrate/database"
 	"github.com/go-sql-driver/mysql"
 )
 
