@@ -208,9 +208,11 @@ func (m *Mysql) Run(migration io.Reader) error {
 		return err
 	}
 
-	query := string(migr[:])
-	if _, err := m.db.Exec(query); err != nil {
-		return database.Error{OrigErr: err, Err: "migration failed", Query: migr}
+	// Not using transactions since alter tables may commit automatically.
+	for _, query := range database.SplitQuery(migr) {
+		if _, err := m.db.Exec(string(query)); err != nil {
+			return database.Error{OrigErr: err, Err: "migration failed", Query: query}
+		}
 	}
 
 	return nil
